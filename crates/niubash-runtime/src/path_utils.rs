@@ -114,8 +114,59 @@ pub(crate) fn resolve_logical_shell_path(value: &str, tmp_base: &Path) -> Option
     let rest = normalized.strip_prefix('/')?;
     match rest.split('/').next() {
         Some("bin" | "dev" | "etc" | "opt" | "usr" | "var") => Some(root.join(rest)),
-        _ => None,
+        _ => root_fallback_path(rest, &root),
     }
+}
+
+/// Engine twin of rubash `root_fallback_path` (`NIU_ROOT_FALLBACK=1`): a
+/// root-relative `rest` whose first component is missing below `root` but
+/// present at the `SystemDrive` root resolves on the drive, so completion
+/// and highlighting agree with `cd /src` reaching `C:\src`.
+pub(crate) fn root_fallback_path(rest: &str, root: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) || !root_fallback_enabled() {
+        return None;
+    }
+    let first = rest
+        .split('/')
+        .find(|part| !part.is_empty() && *part != ".")?;
+    if first == ".."
+        || ROOT_FALLBACK_RESERVED
+            .iter()
+            .any(|reserved| first.eq_ignore_ascii_case(reserved))
+        || root.join(first).exists()
+    {
+        return None;
+    }
+    let drive = std::env::var("SystemDrive")
+        .ok()
+        .filter(|value| value.len() == 2 && value.as_bytes()[1] == b':')
+        .unwrap_or_else(|| "C:".to_string());
+    let drive_root = PathBuf::from(format!("{drive}/"));
+    drive_root
+        .join(first)
+        .exists()
+        .then(|| drive_root.join(rest.trim_start_matches('/')))
+}
+
+/// Root components the shell tree always owns (rubash `ROOT_FALLBACK_RESERVED`).
+const ROOT_FALLBACK_RESERVED: &[&str] = &[
+    "bin", "cygdrive", "dev", "etc", "home", "lib", "lib64", "mnt", "opt", "proc", "sbin", "tmp",
+    "usr", "var",
+];
+
+/// `NIU_ROOT_FALLBACK` (or `RUBASH_ROOT_FALLBACK`) set to anything but empty,
+/// `0`, `false`, `no` or `off`.
+pub(crate) fn root_fallback_enabled() -> bool {
+    ["NIU_ROOT_FALLBACK", "RUBASH_ROOT_FALLBACK"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .any(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && !["0", "false", "no", "off"]
+                    .iter()
+                    .any(|off| value.eq_ignore_ascii_case(off))
+        })
 }
 
 /// Split a shell PATH list into entries. `;` always separates; `:` separates
@@ -391,6 +442,48 @@ mod tests {
         let session_base = unique_temp_dir("g2-no-root");
         assert_eq!(resolve_logical_shell_path("/tmp", &session_base), None);
         let _ = fs::remove_dir_all(session_base);
+    }
+
+    /// nt fix (NIU_ROOT_FALLBACK): with the opt-in fallback, a first
+    /// component missing below NIU_ROOT but present at the SystemDrive
+    /// root resolves on the drive; reserved members and real root
+    /// children keep the root; without the flag the arm stays out.
+    #[cfg(windows)]
+    #[test]
+    fn root_fallback_resolves_missing_root_children_on_system_drive() {
+        let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = unique_temp_dir("root-fallback");
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let _root = EnvGuard::set("NIU_ROOT", &root);
+        let _flag = EnvGuard {
+            name: "NIU_ROOT_FALLBACK",
+            previous: std::env::var_os("NIU_ROOT_FALLBACK"),
+        };
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        let drive_root = PathBuf::from(format!("{drive}/"));
+
+        std::env::remove_var("NIU_ROOT_FALLBACK");
+        assert_eq!(resolve_logical_shell_path("/Windows", &temp), None);
+        std::env::set_var("NIU_ROOT_FALLBACK", "0");
+        assert_eq!(resolve_logical_shell_path("/Windows", &temp), None);
+
+        std::env::set_var("NIU_ROOT_FALLBACK", "1");
+        assert_eq!(
+            resolve_logical_shell_path("/Windows/System32", &temp),
+            Some(drive_root.join("Windows/System32"))
+        );
+        assert_eq!(
+            resolve_logical_shell_path("/etc/x", &temp),
+            Some(root.join("etc/x"))
+        );
+        assert_eq!(
+            resolve_logical_shell_path("/niu-root-fallback-missing-xyz", &temp),
+            None
+        );
+        fs::create_dir_all(root.join("Windows")).unwrap();
+        assert_eq!(resolve_logical_shell_path("/Windows", &temp), None);
+        let _ = fs::remove_dir_all(temp);
     }
 
     /// niubash#304: the atomic writer replaces existing content in one

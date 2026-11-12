@@ -180,6 +180,27 @@ optional eza recommendation, which only appears when you have eza on
 `PATH`), remove that alias before defining the function; niu never rewrites
 your rc.
 
+### Drive-root fallback (opt-in)
+
+`/` names `NIU_ROOT`, so a host directory such as `C:\src` is reachable only
+as `/c/src`. Set `NIU_ROOT_FALLBACK=1` (environment or `export` in
+`~/.niubashrc`; Rubash also reads `RUBASH_ROOT_FALLBACK`) to let an absolute
+POSIX path whose first component does not exist below `NIU_ROOT` resolve
+against the `SystemDrive` root instead: `cd /src`, `ls /src`, `[ -d /src ]`
+and redirects then reach `C:\src`. The rules (Rubash `root_fallback_path`):
+
+- the bare `/` and the shell-tree members `bin`, `cygdrive`, `dev`, `etc`,
+  `home`, `lib`, `lib64`, `mnt`, `opt`, `proc`, `sbin`, `tmp`, `usr`, `var`
+  never fall back;
+- a real child of `NIU_ROOT` wins over the drive;
+- the probe is per first component, so `mkdir /src/new` lands beside
+  `cd /src`; when neither side exists the root mapping (and its error) stays;
+- operands that fall back are translated for every child class, including
+  the bundled applets, whose own shell-tree layer would map them below
+  `NIU_ROOT`.
+
+`0`, `false`, `no`, `off` or an empty value disable it (the default).
+
 ## Dispatcher Selection
 
 `WINUXCMD_PATH` selects one exact dispatcher executable for the session.
