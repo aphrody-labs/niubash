@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4.2.2
 
       - name: Checkout rubash path dependency
-        run: git clone --depth 1 --branch nt/fix-root-fallback https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
+        run: git clone --depth 1 --branch master https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
 
       # rubash#827: keep the release-pin verifier honest on every PR (local
       # fixtures, no network). The verifier audits scripts/release/rubash-pin.json
@@ -102,7 +102,7 @@ jobs:
       # Cargo.toml resolves rubash to a sibling checkout -- same step the
       # build-and-test job uses.
       - name: Checkout rubash path dependency
-        run: git clone --depth 1 --branch nt/fix-root-fallback https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
+        run: git clone --depth 1 --branch master https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.11
@@ -169,7 +169,7 @@ jobs:
       - uses: actions/checkout@v4.2.2
 
       - name: Checkout rubash path dependency
-        run: git clone --depth 1 --branch nt/fix-root-fallback https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
+        run: git clone --depth 1 --branch master https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.11
@@ -245,7 +245,7 @@ jobs:
       - uses: actions/checkout@v4.2.2
 
       - name: Checkout rubash path dependency
-        run: git clone --depth 1 --branch nt/fix-root-fallback https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
+        run: git clone --depth 1 --branch master https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.11
@@ -347,7 +347,7 @@ jobs:
       - uses: actions/checkout@v4.2.2
 
       - name: Checkout rubash path dependency
-        run: git clone --depth 1 --branch nt/fix-root-fallback https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
+        run: git clone --depth 1 --branch master https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.11
