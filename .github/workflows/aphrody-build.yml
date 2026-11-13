@@ -1,0 +1,60 @@
+name: aphrody build
+
+# Binaire niu de la chaîne aphrody (monorepo src : scripts/unixwin/unixwin.ts fetch-ci) : niubash de ce fork
+# construit contre le fork aphrody-labs/rubash, sans signature ni publication.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      rubash_rev:
+        description: "Commit ou branche de aphrody-labs/rubash"
+        required: false
+        default: master
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Checkout rubash (fork)
+        shell: bash
+        env:
+          RUBASH_REV: ${{ inputs.rubash_rev || 'master' }}
+        run: |
+          git clone -q --filter=blob:none https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
+          git -C ../rubash -c advice.detachedHead=false checkout -q "$RUBASH_REV"
+          git -C ../rubash rev-parse HEAD > rubash.rev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1.11
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+
+      - name: Build niu
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin niu
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          out=dist/${{ matrix.target }}
+          mkdir -p "$out"
+          cp target/${{ matrix.target }}/release/niu.exe "$out/"
+          printf 'niubash %s\nrubash %s\n' "$GITHUB_SHA" "$(cat rubash.rev)" > "$out/SOURCES"
+          (cd "$out" && sha256sum niu.exe > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: niu-${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 90
