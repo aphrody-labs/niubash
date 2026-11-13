@@ -76,7 +76,7 @@ jobs:
       - name: rubash Windows unit tests (fork fixes)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         working-directory: ../rubash
-        run: "cargo test --locked --lib -- builtins::pwd executor::path:: executor::glob::"
+        run: "cargo test --locked --lib -- builtins::pwd executor::path:: executor::glob:: executor::env_helpers::"
 
       - name: Stage artifact
         shell: bash
