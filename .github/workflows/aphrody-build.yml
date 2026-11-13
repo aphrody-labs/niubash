@@ -16,6 +16,34 @@ permissions:
   contents: read
 
 jobs:
+  # Chaîne de src sur prd : Linux -> Windows par cargo xwin (CRT MSVC + SDK téléchargés, lld-link, llvm-rc).
+  cross-xwin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Checkout rubash (fork)
+        env:
+          RUBASH_REV: ${{ inputs.rubash_rev || 'master' }}
+        run: |
+          git clone -q --filter=blob:none https://github.com/${{ github.repository_owner }}/rubash.git ../rubash
+          git -C ../rubash -c advice.detachedHead=false checkout -q "$RUBASH_REV"
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1.11
+        with:
+          target: x86_64-pc-windows-msvc
+          cache: false
+      # LLVM préinstallé sur l'image ubuntu-latest (/usr/lib/llvm-N/bin) mis sur le PATH.
+      - name: LLVM (clang-cl, lld-link, llvm-rc) and cargo-xwin
+        run: |
+          v=$(ls -d /usr/lib/llvm-* | sed 's/.*llvm-//' | sort -n | tail -1)
+          echo "/usr/lib/llvm-$v/bin" >> "$GITHUB_PATH"
+          ls /usr/lib/llvm-$v/bin/clang-cl /usr/lib/llvm-$v/bin/lld-link /usr/lib/llvm-$v/bin/llvm-rc
+          cargo install --locked cargo-xwin
+      - name: Cross build niu.exe
+        run: cargo xwin build --release --locked --target x86_64-pc-windows-msvc --bin niu
+      - name: PE check
+        run: file target/x86_64-pc-windows-msvc/release/niu.exe | grep -q "PE32+ executable"
+
   windows:
     strategy:
       fail-fast: false

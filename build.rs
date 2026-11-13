@@ -486,6 +486,7 @@ fn embed_windows_icon() {
 
     println!("cargo:rerun-if-changed={}", rc_file.display());
     println!("cargo:rerun-if-changed={}", icon_file.display());
+    println!("cargo:rerun-if-env-changed=RC");
 
     let rc_exe = find_resource_compiler().unwrap_or_else(|| {
         panic!(
@@ -507,9 +508,16 @@ fn embed_windows_icon() {
 
     println!("cargo:rustc-link-arg-bin=niu={}", out_file.display());
 
+    // `RC` names the compiler explicitly; `llvm-rc` without .exe is the
+    // Linux/macOS host binary of a cross build to *-pc-windows-msvc
+    // (cargo xwin), which accepts the same /nologo /fo options.
     fn find_resource_compiler() -> Option<PathBuf> {
-        find_in_path("rc.exe")
+        std::env::var_os("RC")
+            .map(PathBuf::from)
+            .filter(|rc| rc.is_file())
+            .or_else(|| find_in_path("rc.exe"))
             .or_else(|| find_in_path("llvm-rc.exe"))
+            .or_else(|| find_in_path("llvm-rc"))
             .or_else(find_windows_sdk_rc)
     }
 
