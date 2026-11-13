@@ -71,6 +71,13 @@ jobs:
       - name: Build niu
         run: cargo build --release --locked --target ${{ matrix.target }} --bin niu
 
+      # Tests Windows des correctifs du fork rubash (builtins pwd, translation des chemins) : prd n'exécute que
+      # les tests Linux.
+      - name: rubash Windows unit tests (fork fixes)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        working-directory: ../rubash
+        run: cargo test --locked --lib -- builtins::pwd executor::path::
+
       - name: Stage artifact
         shell: bash
         run: |
