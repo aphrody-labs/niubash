@@ -1,0 +1,40 @@
+{
+  "assets_total": 4136,
+  "assets_per_tier": {
+    "t1": 548,
+    "t2": 587,
+    "t3": 1698,
+    "t4": 469,
+    "t5": 834
+  },
+  "occurrences_total": 4337,
+  "occurrences_per_tier": {
+    "t1": 548,
+    "t2": 588,
+    "t3": 1715,
+    "t4": 600,
+    "t5": 886
+  },
+  "dedup_ratio": 1.049,
+  "assets_per_category": {
+    "alias": 383,
+    "completion": 697,
+    "framework": 415,
+    "init-hooks": 48,
+    "keybinding": 47,
+    "linter": 21,
+    "plugin": 138,
+    "prompt-fragment": 485,
+    "test-framework": 366,
+    "theme": 16,
+    "tool": 8,
+    "unknown": 1512
+  },
+  "repos_harvested": {
+    "t1": 5,
+    "t2": 7,
+    "t3": 327,
+    "t5": 1000
+  },
+  "repos_with_tui_meta": 1329
+}
