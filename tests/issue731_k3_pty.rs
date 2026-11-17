@@ -11,6 +11,9 @@
 //! * `vi-editing-mode` — the bound key maps to
 //!   `ReedlineEvent::SwitchMode`: the standby vi machine takes over and
 //!   `ESC x` deletes under vi-normal semantics.
+//! * `history-search-backward` — the bound key maps to
+//!   `ReedlineEvent::HistorySearch { anchored: true }`: a typed prefix
+//!   filters the recall instead of stepping back one entry.
 //!
 //! Each check also asserts the boot screen carries no "key bindings …
 //! not applied" notice for its bind (the registry's actionable-warning
@@ -151,6 +154,100 @@ fn pty_k3_redraw_current_line_repaints_identically() {
     s.wait_exit();
 }
 
+/// Chord observation ① (the #704 review's idle-flush note, carried
+/// here as K3 scope item 4): GNU's `keyseq-timeout` fires on its own —
+/// a parked chord prefix replays through the inner machine after the
+/// window with no partner key (readline.c `_rl_dispatch_subseq`, whose
+/// `_rl_input_queued` wait returns the shadowed function). A letter
+/// chord proves it end to end: `bind '"zx": kill-whole-line'` parks
+/// `z` for the window, then the plain `z` self-inserts by itself —
+/// and `z`+`x` inside the window still completes the bound command.
+#[test]
+fn pty_k3_chord_keyseq_timeout_flushes_on_idle() {
+    if !require_pty_or_skip("pty_k3_chord_keyseq_timeout_flushes_on_idle") {
+        return;
+    }
+    let mut s = spawn_k3("chordidle", "bind '\"zx\": kill-whole-line'\n");
+    s.wait_ready();
+    s.expect_absent("not applied", Duration::from_secs(2));
+
+    // Lone `z`: after ~`keyseq-timeout` of idle the prefix expires and
+    // the letter self-inserts — under the old next-key flush the screen
+    // stayed bare until a second key was pressed.
+    s.send("z");
+    std::thread::sleep(Duration::from_millis(1200));
+    let screen = normalize_screen(&s.drain_screen());
+    let tail = screen.rsplit("P1>").next().unwrap_or("");
+    assert!(
+        tail.contains('z'),
+        "idle keyseq-timeout must flush the parked 'z' into the buffer:\n{screen}"
+    );
+
+    // `z`+`x` inside the window still completes the chord — the typed
+    // text dies with the line.
+    s.send(driver::CTRL_C);
+    s.expect_prompt();
+    s.send("victim");
+    s.send("zx");
+    std::thread::sleep(Duration::from_millis(800));
+    let screen = normalize_screen(&s.drain_screen());
+    let tail = screen.rsplit("P1>").next().unwrap_or("");
+    assert!(
+        !tail.contains("victim"),
+        "z+x inside the window must complete the chord (kill-whole-line):\n{screen}"
+    );
+
+    s.send(driver::CTRL_C);
+    s.expect_prompt();
+    s.send_line("exit");
+    s.wait_exit();
+}
+
+/// Host-channel widening (K3 WP3): the emacs_ctlx defaults bashline.c
+/// binds (`C-x C-v` display-shell-version, `M-C-t`
+/// shell-transpose-words — bashline.c:533/:635) ride the readline
+/// host channel, so an UNCONFIGURED prompt answers them. The version
+/// banner is the engine's own `show_shell_version` text; the
+/// transpose swaps the two shellwords around point.
+#[test]
+fn pty_k3_host_channel_delivers_gnu_ctlx_and_meta_defaults() {
+    if !require_pty_or_skip("pty_k3_host_channel_delivers_gnu_ctlx_and_meta_defaults") {
+        return;
+    }
+    let mut s = spawn_k3("hostchan", "");
+    s.wait_ready();
+    s.expect_absent("not applied", Duration::from_secs(2));
+
+    // C-x C-v → display-shell-version: the GNU banner line prints.
+    s.send("\u{18}\u{16}");
+    std::thread::sleep(Duration::from_millis(900));
+    let screen = normalize_screen(&s.drain_screen());
+    assert!(
+        screen.contains("GNU bash, version"),
+        "C-x C-v must print the GNU version banner through the host channel:\n{screen}"
+    );
+
+    // M-C-t → shell-transpose-words (ESC then Ctrl-T is the wire
+    // shape of Meta-Ctrl-T): "alpha beta" at point-end becomes
+    // "beta alpha".
+    s.send(driver::CTRL_C);
+    s.expect_prompt();
+    s.send("alpha beta");
+    s.send("\u{1b}\u{14}");
+    std::thread::sleep(Duration::from_millis(700));
+    let screen = normalize_screen(&s.drain_screen());
+    let tail = screen.rsplit("P1>").next().unwrap_or("");
+    assert!(
+        tail.contains("beta alpha"),
+        "M-C-t must transpose the shellwords (beta alpha):\n{screen}"
+    );
+
+    s.send(driver::CTRL_C);
+    s.expect_prompt();
+    s.send_line("exit");
+    s.wait_exit();
+}
+
 /// `vi-editing-mode` switches into the standby vi machine: after the
 /// bound key, `ESC` lands in vi-normal and `x` deletes the character
 /// under the cursor — a mechanism the emacs machine does not have.
@@ -177,6 +274,46 @@ fn pty_k3_vi_editing_mode_switches_machines() {
     assert!(
         tail.contains("zzab") && !tail.contains("zzabc"),
         "vi-editing-mode must activate the vi machine (x deleted 'c'):\n{screen}"
+    );
+
+    s.send(driver::CTRL_C);
+    s.expect_prompt();
+    s.send_line("exit");
+    s.wait_exit();
+}
+
+/// `history-search-backward` is GNU's anchored prefix search (search.c
+/// `rl_history_search_backward`), not a plain Up: with `uni` typed,
+/// the bound key must land on the newest history entry STARTING with
+/// `uni` and skip the more recent entry that does not match.
+#[test]
+fn pty_k3_history_search_backward_is_anchored() {
+    if !require_pty_or_skip("pty_k3_history_search_backward_is_anchored") {
+        return;
+    }
+    let mut s = spawn_k3("hsearch", "bind '\"\\C-q\": history-search-backward'\n");
+    s.wait_ready();
+    s.expect_absent("not applied", Duration::from_secs(2));
+
+    // Seed history: a matching entry, then a newer non-matching one a
+    // plain `Up` would have recalled.
+    s.send_line("unique731alpha");
+    s.expect_prompt();
+    s.send_line("zzdifferent731");
+    s.expect_prompt();
+
+    s.send("uni");
+    s.send("\u{11}"); // C-q → HistorySearch{Backward, anchored}
+    std::thread::sleep(Duration::from_millis(800));
+    let screen = normalize_screen(&s.drain_screen());
+    let tail = screen.rsplit("P1>").next().unwrap_or("");
+    assert!(
+        tail.contains("unique731alpha"),
+        "anchored history-search must land on the prefix match:\n{screen}"
+    );
+    assert!(
+        !tail.contains("zzdifferent731"),
+        "a plain Up would have recalled the non-matching latest entry:\n{screen}"
     );
 
     s.send(driver::CTRL_C);

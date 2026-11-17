@@ -476,6 +476,23 @@ documentation — not bugs to fix):
   Bash's 177th entry is a Git-for-Windows patch artifact, not GNU.
   `shopt` likewise rejects `completion_strip_exe`, a
   Cygwin/Git-for-Windows extension upstream bash has no option for.
+- `cmd //c` is the MSYS escape spelling, and niu does not fold `//`:
+  cmd.exe receives the literal `//c`, does not recognise it as a
+  switch, and opens an interactive session — the failure mode is a
+  hang (a prompt on stdin), not an error (niubash#993 §2). Write
+  `cmd /c`, which works as typed: under Git Bash the bare `/c` is the
+  fragile form (MSYS rewrites it to `C:/`), which is exactly why the
+  `//c` escape exists there.
+- `ssh -i /c/…` fails with `Warning: Identity file /c/… not
+  accessible`: niu resolves the Windows OpenSSH port — no MSYS
+  filesystem — and `ssh`/`scp`/`sftp` are namespace bridges whose
+  argv is passed verbatim, so a `/c/…` spelling for a *local* file
+  never reaches one OpenSSH can open (niubash#993 §9). Spell local
+  paths `C:/…` — that covers `-i`, `-F`, the local side of
+  `scp`/`sftp`, `ssh-keygen -f`, and `IdentityFile`/`Include` in
+  `~/.ssh/config`; remote-path operands keep their POSIX spelling by
+  design. Git Bash survives `/c/…` because its ssh is an MSYS build
+  that resolves the prefix in-process.
 
 ## Calling PowerShell from niu
 
