@@ -100,7 +100,7 @@ mod skill;
 // FUNCNEST=0 recursion to f=201 with headroom — mirrors rubash's main.rs.
 const NIU_MAIN_STACK_SIZE: usize = 512 * 1024 * 1024;
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     // Restore the console (raw mode, cursor) on the panic path before the
     // default hook reports; with `panic = "abort"` this is the last code
     // that runs because no Drop guards execute.

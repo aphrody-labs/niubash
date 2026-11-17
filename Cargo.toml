@@ -10,6 +10,13 @@ readme = "README.md"
 homepage = "https://github.com/unixwin/niubash"
 repository = "https://github.com/unixwin/niubash"
 
+# The host as a library: another binary (aysh) embeds the whole launcher by calling
+# `niubash_host::main()`. The file is shared with the `niu` binary below on purpose, so the
+# two can never drift; Cargo notes the shared file with a warning.
+[lib]
+name = "niubash_host"
+path = "src/main.rs"
+
 [[bin]]
 name = "niu"
 path = "src/main.rs"
