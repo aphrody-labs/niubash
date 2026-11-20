@@ -307,18 +307,62 @@ pub fn self_update_command_args(line: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Environment variable set on `--self-update` child processes spawned from
+/// an interactive REPL or `-C` command so the child only signals a session
+/// exit when it actually launched an installer (niubash#1013).
+pub const SELF_UPDATE_HANDOFF_ENV: &str = "NIU_SELF_UPDATE_HANDOFF";
+
+/// Exit code returned by a `--self-update` child under
+/// [`SELF_UPDATE_HANDOFF_ENV`] when it actually launched the installer and
+/// the parent REPL must exit so `niu.exe` can be replaced. Any other exit
+/// code (including `0` for already-up-to-date, `--check`, `--dry-run`,
+/// `--help`, or Store/Scoop-managed installs) keeps the REPL alive.
+pub const SELF_UPDATE_HANDOFF_EXIT_CODE: i32 = 200;
+
+/// Outcome of a `self-update` child process spawned from the REPL or `-C`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfUpdateHandoff {
+    /// Exit status to report to the shell (`$?`) or `-C` caller.
+    pub exit_code: i32,
+    /// `true` only when the child launched the installer and the parent
+    /// interactive REPL must exit so `niu.exe` can be replaced.
+    pub installer_launched: bool,
+}
+
 /// Hand `self-update` off to a child process of the current executable with
-/// `--self-update`, then exit this shell so the installer can replace the
-/// binary. Returns `None` when spawning is not possible; otherwise the child
-/// exit code.
-pub fn spawn_self_update(args: &[String]) -> Option<i32> {
+/// `--self-update`, returning its outcome. Under [`SELF_UPDATE_HANDOFF_ENV`],
+/// the child exits with [`SELF_UPDATE_HANDOFF_EXIT_CODE`] only when an
+/// installer was actually launched; every other `0` / non-zero exit keeps
+/// an interactive REPL alive with that status in `$?`. Returns `None` when
+/// spawning is not possible.
+pub fn spawn_self_update(args: &[String]) -> Option<SelfUpdateHandoff> {
     let exe = std::env::current_exe().ok()?;
     let mut command = std::process::Command::new(exe);
-    command.arg("--self-update").args(args);
+    command
+        .arg("--self-update")
+        .args(args)
+        .env(SELF_UPDATE_HANDOFF_ENV, "1");
     let mut child = command.spawn().ok()?;
     crate::console_guard::adopt_orphan_console(child.id());
     let status = child.wait().ok()?;
-    Some(status.code().unwrap_or(0))
+    Some(classify_self_update_exit(status.code()))
+}
+
+fn classify_self_update_exit(code: Option<i32>) -> SelfUpdateHandoff {
+    match code {
+        Some(SELF_UPDATE_HANDOFF_EXIT_CODE) => SelfUpdateHandoff {
+            exit_code: 0,
+            installer_launched: true,
+        },
+        Some(other) => SelfUpdateHandoff {
+            exit_code: other,
+            installer_launched: false,
+        },
+        None => SelfUpdateHandoff {
+            exit_code: 1,
+            installer_launched: false,
+        },
+    }
 }
 
 /// Build a `Reedline` instance for the shell.
@@ -4313,7 +4357,7 @@ fn add_engine_bind_keybindings_recorded<S: KeybindingSink + ?Sized>(
             );
             continue;
         };
-        let event = match &entry.kind {
+        let event = match crate::keymap_registry::delivery_kind(&entry.kind).as_ref() {
             rubash::api::BindKindView::Execute { .. } => ReedlineEvent::ExecuteHostCommand(
                 format!("{BINDX_HOST_COMMAND_PREFIX}{}", index_base + index),
             ),
@@ -4460,6 +4504,12 @@ fn add_engine_bind_keybindings_recorded<S: KeybindingSink + ?Sized>(
                         }
                     }
                 }
+            }
+            // `delivery_kind` rewrites Keymap onto
+            // Function(prefix-meta) before this match; the arm only
+            // keeps the match exhaustive over the public enum.
+            rubash::api::BindKindView::Keymap { .. } => {
+                unreachable!("delivery_kind normalizes Keymap to Function(prefix-meta)")
             }
         };
         keybindings.add_binding(modifiers, key_code, event);
@@ -5834,6 +5884,11 @@ fn collect_chord_bindings(
                     }
                 }
             }
+            // A keymap-valued binding (rubash#3013) enters another
+            // readline map on that key; it is not a chord event. The
+            // flat layer mirrors it as the `prefix-meta` function
+            // (readline_live.rs).
+            rubash::api::BindKindView::Keymap { .. } => continue,
         };
         chords.push(ChordBinding { keys, event });
     }
@@ -6466,17 +6521,10 @@ pub(crate) fn parse_keymap_bind_rule(
         rubash::builtins::bind::BindingSpec::Function { name } => BindKindView::Function { name },
         rubash::builtins::bind::BindingSpec::Macro { text } => BindKindView::Macro { text },
         // `BindingSpec::Keymap` (rubash#2993): a key bound to a whole
-        // keymap (GNU bind.c:1845 ISKMAP). This explicit arm consumes it
-        // per the engine's current view contract: `BindKindView` has no
-        // keymap variant, so render it the way the engine's own view
-        // layer does in `BindView::capture` (rubash `src/api/bind.rs`)
-        // — as the `prefix-meta` function name. A keymap-valued
-        // `BindKindView` variant and its ledger rows are still the
-        // rubash#3013 engine half; this arm upgrades with that contract
-        // change when it lands.
-        rubash::builtins::bind::BindingSpec::Keymap { .. } => BindKindView::Function {
-            name: "prefix-meta".to_string(),
-        },
+        // keymap (GNU bind.c:1845 ISKMAP). rubash#3013's
+        // `BindKindView::Keymap` now carries the target map, so the rule
+        // records the real kind instead of the `prefix-meta` shim.
+        rubash::builtins::bind::BindingSpec::Keymap { name } => BindKindView::Keymap { name },
     };
     Ok(KeymapBindRule {
         keyseq: parsed.keyseq,
@@ -7742,12 +7790,21 @@ pub fn run_repl(shell: Shell) -> anyhow::Result<()> {
                 }
                 if pending.is_empty() {
                     if let Some(args) = self_update_command_args(line) {
-                        if let Some(code) = spawn_self_update(&args) {
-                            // niubash#642: self-update ends the session
-                            // like any other exit — EXIT trap and the
-                            // session-end history write included (this
-                            // path used to skip both).
-                            end_repl_session(&mut shell.borrow_mut(), code);
+                        if let Some(handoff) = spawn_self_update(&args) {
+                            if handoff.installer_launched {
+                                // niubash#642: self-update ends the session
+                                // like any other exit — EXIT trap and the
+                                // session-end history write included (this
+                                // path used to skip both).
+                                end_repl_session(&mut shell.borrow_mut(), handoff.exit_code);
+                            }
+                            {
+                                let mut shell_ref = shell.borrow_mut();
+                                shell_ref.session_mut().set_last_status(handoff.exit_code);
+                                shell_ref.last_interactive_exit_code = Some(handoff.exit_code);
+                            }
+                            flush_repl_output();
+                            continue;
                         }
                     }
                 }
@@ -8114,6 +8171,18 @@ fn run_repl_without_line_editor(shell: &mut Shell) -> anyhow::Result<()> {
                 shell.record_accepted_history_line(line);
                 end_repl_session(shell, status);
             }
+            if let Some(args) = self_update_command_args(line) {
+                if let Some(handoff) = spawn_self_update(&args) {
+                    shell.record_accepted_history_line(line);
+                    if handoff.installer_launched {
+                        end_repl_session(shell, handoff.exit_code);
+                    }
+                    shell.session_mut().set_last_status(handoff.exit_code);
+                    shell.last_interactive_exit_code = Some(handoff.exit_code);
+                    flush_repl_output();
+                    continue;
+                }
+            }
         }
 
         pending.push(line);
@@ -8201,6 +8270,38 @@ mod tests {
         assert!(!is_repl_reserved_command("Self-Update"));
         assert!(!is_repl_reserved_command("self_update"));
         assert!(!is_repl_reserved_command("ls"));
+    }
+
+    #[test]
+    fn classify_self_update_exit_only_exits_repl_on_handoff_sentinel() {
+        assert_eq!(
+            classify_self_update_exit(Some(SELF_UPDATE_HANDOFF_EXIT_CODE)),
+            SelfUpdateHandoff {
+                exit_code: 0,
+                installer_launched: true,
+            }
+        );
+        assert_eq!(
+            classify_self_update_exit(Some(0)),
+            SelfUpdateHandoff {
+                exit_code: 0,
+                installer_launched: false,
+            }
+        );
+        assert_eq!(
+            classify_self_update_exit(Some(1)),
+            SelfUpdateHandoff {
+                exit_code: 1,
+                installer_launched: false,
+            }
+        );
+        assert_eq!(
+            classify_self_update_exit(None),
+            SelfUpdateHandoff {
+                exit_code: 1,
+                installer_launched: false,
+            }
+        );
     }
 
     #[test]

@@ -220,6 +220,7 @@ niu 的语言语义就是 rubash 引擎的语义，门禁靠机械手段、不�
 - **niu 跑得了真 Bash 脚本吗？** 跑得了。rubash 引擎以 GNU Bash 官方上游测试套件作门禁，记录在[兼容性矩阵](docs/src/rubash-bash-compat-matrix.md)。
 - **不止于 Git Bash 兼容。** 控制台设备重定向在连 Git Bash 都失败的地方照常工作：`echo >/dev/tty`、`exec 3<>/dev/tty`、`test -e /dev/tty` 全部与 GNU 一致——引擎把 `/dev/tty` 映射到控制台，并把 `CON` 拆成 `CONIN$`/`CONOUT$` 两半，绕开 Windows 对 `CON` 的设备打开限制（`CON` 上拒绝 `FILE_APPEND_DATA` 与读写打开）。`git`/`ssh` 的 askpass 提示靠的正是这个。（引擎侧线索：[rubash#1312](https://github.com/unixwin/rubash/issues/1312)、[rubash#1314](https://github.com/unixwin/rubash/issues/1314)、[niubash#519](https://github.com/unixwin/niubash/issues/519)。）
 - **现在能在 Android 或鸿蒙上装 niu 吗？** Android 能：v1.4.3 起 release 自带 `.zip`，真机（Termux aarch64/armv7）可运行。鸿蒙还不能：CI 能编译，但没有可安装产物。
+- **niu 用的是哪个 git？niu 的 git 怎么给 pwsh / IDE 用？** 你自己装的 git 在 niu 内优先（启动时会把你的 `PATH` 上第一个 git 目录提升到随包目录之前）；niubash 之外的程序要直接调随包 niugit，用安装里唯一的 `PATH` 入口目录 `<root>\winuxcmd\bin`，不要把 `usr\bin` 放上 `PATH`。细节与做法见[使用 Git](docs/src/using-git.md)（[#1049](https://github.com/unixwin/niubash/issues/1049)、[#1050](https://github.com/unixwin/niubash/issues/1050)）。
 - **从 Git Bash 迁来的脚本里 `cmd //c` 为什么停在提示符？** `//` 是 MSYS 自家参数改写的转义拼写，niu 没有这层改写：双斜杠原样到达 cmd.exe，`//c` 不是 cmd 认识的开关，cmd 于是开一个交互会话——失败形态是挂起，不是报错。写 `cmd /c` 即可——这个在 MSYS 下反而脆弱的拼写，在 niu 下原样可用（[路径契约](docs/src/windows-path-contract.md)）。
 
 ## 已知限制，明说
@@ -240,7 +241,7 @@ niu 的语言语义就是 rubash 引擎的语义，门禁靠机械手段、不�
 ## 贡献者
 
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-12-orange.svg?style=flat-square)](#contributors)
+[![All Contributors](https://img.shields.io/badge/all_contributors-13-orange.svg?style=flat-square)](#contributors)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
 感谢每一位共建 niubash 的贡献者——issue、修复、插件、移植贡献，以及上游引擎的工作 ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
@@ -252,7 +253,7 @@ niu 的语言语义就是 rubash 引擎的语义，门禁靠机械手段、不�
   <tbody>
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/caomengxuan666"><img src="https://avatars.githubusercontent.com/u/114896873?v=4&size=100" width="100px" height="100px" alt="caomengxuan666"/><br /><sub><b>caomengxuan666</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=caomengxuan666" title="Code">💻</a> <a href="#maintenance-caomengxuan666" title="Maintenance">🚧</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/a-rookie-of-C-language"><img src="https://avatars.githubusercontent.com/u/186315048?v=4&size=100" width="100px" height="100px" alt="a-rookie-of-C-language"/><br /><sub><b>a-rookie-of-C-language</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=a-rookie-of-C-language" title="Code">💻</a> <a href="#maintenance-a-rookie-of-C-language" title="Maintenance">🚧</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/arookieofc"><img src="https://avatars.githubusercontent.com/u/186315048?v=4&size=100" width="100px" height="100px" alt="arookieofc"/><br /><sub><b>arookieofc</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=arookieofc" title="Code">💻</a> <a href="#maintenance-arookieofc" title="Maintenance">🚧</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/apps/devin-ai-integration"><img src="https://avatars.githubusercontent.com/u/158243242?v=4&size=100" width="100px" height="100px" alt="devin-ai-integration[bot]"/><br /><sub><b>devin-ai-integration[bot]</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=devin-ai-integration[bot]" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/daiaji"><img src="https://avatars.githubusercontent.com/u/25875791?v=4&size=100" width="100px" height="100px" alt="daiaji"/><br /><sub><b>daiaji</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=daiaji" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/cognition-team"><img src="https://avatars.githubusercontent.com/u/167951170?v=4&size=100" width="100px" height="100px" alt="cognition-team"/><br /><sub><b>cognition-team</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=cognition-team" title="Code">💻</a></td>
@@ -265,6 +266,7 @@ niu 的语言语义就是 rubash 引擎的语义，门禁靠机械手段、不�
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/x2410516039"><img src="https://avatars.githubusercontent.com/u/234159335?v=4&size=100" width="100px" height="100px" alt="x2410516039"/><br /><sub><b>x2410516039</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=x2410516039" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/cmx"><img src="https://avatars.githubusercontent.com/u/42783691?v=4&size=100" width="100px" height="100px" alt="cmx"/><br /><sub><b>cmx</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=cmx" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/apps/github-actions"><img src="https://avatars.githubusercontent.com/u/41898282?v=4&size=100" width="100px" height="100px" alt="github-actions[bot]"/><br /><sub><b>github-actions[bot]</b></sub></a><br /><a href="#tool-github-actions[bot]" title="Tools">🔧</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/arookieofc-ai"><img src="https://avatars.githubusercontent.com/u/282213208?v=4&size=100" width="100px" height="100px" alt="arookieofc-ai"/><br /><sub><b>arookieofc-ai</b></sub></a><br /><a href="https://github.com/unixwin/niubash/commits?author=arookieofc-ai" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

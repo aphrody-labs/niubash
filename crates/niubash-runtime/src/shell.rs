@@ -507,12 +507,42 @@ fn default_script_name_from(raw: Option<String>) -> String {
     // The four faces the shim forwards (rubash#598): sh/ash key the POSIX
     // contract, bash/rbash only need `$0` to read the invocation name
     // (GNU shell.c set_shell_name binds dollar_vars[0] to argv[0] for
-    // every face; shell.c:1258-1299 keys rbash off it). Everything else
-    // stays the plain-niu default.
+    // every face; shell.c:1258-1299 keys rbash off it). Every other
+    // name binds its basename verbatim below.
     if matches!(unmarked, "sh" | "ash" | "bash" | "rbash") {
-        stem.to_string()
-    } else {
+        return stem.to_string();
+    }
+    // GNU shell.c:1797-1799 set_shell_name binds dollar_vars[0] to
+    // argv[0]'s basename VERBATIM — the name is not filtered to known
+    // faces — so `exec -a ohio-state bash -c 'echo $0'` prints
+    // `ohio-state` (exec5.sub). The only bytes dropped are the
+    // Windows `.exe` executable suffix — a platform artifact, not part
+    // of the invoked name (the face path above and the
+    // __RUBASH_SHELL_NAME seed strip it the same way), so `niu.exe`
+    // still reports `niu`. The leading '-' login mark stays in $0
+    // exactly as GNU keeps it: shell.c strips it only from the
+    // shell_name copy that keys login_shell and the face checks,
+    // and niubash's own face contract keeps it too (`-sh` -> `-sh`).
+    // niubash#3605: the previous "niu" fallback made every
+    // non-face argv[0] report $0 = niu.
+    let name = strip_exe_suffix(basename);
+    if name.is_empty() {
         "niu".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The basename minus a trailing `.exe` in any letter case. Windows
+/// argv[0] always carries the executable suffix (`niu.exe`); it is a
+/// platform artifact, not part of the invoked name, so $0 binds
+/// without it while every other byte stays verbatim.
+fn strip_exe_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
     }
 }
 
@@ -2303,7 +2333,29 @@ impl Shell {
         // prompt or command line, like every other startup file
         // (niubash#402).
         let login = self.login_shell_active();
-        if login {
+        // niubash#1057: on Windows the login marker no longer diverts the
+        // ORDINARY interactive face onto the GNU profile chain. The
+        // CHANGELOG's standing contract is "Windows accepts the flags
+        // with unchanged behavior (no login concept)" (since 1.4.0), and
+        // on a bare Windows home none of /etc/profile, ~/.bash_profile,
+        // ~/.bash_login, ~/.profile exists — `niu --login -i` sourced
+        // NOTHING instead of ~/.niubashrc. GNU shell.c:1833's "the login
+        // profile chain replaces the interactive-RC alternative" is
+        // therefore a deliberate product fork here, not a
+        // GNU-alignment gap: this funnel treats `-l`/`--login` exactly
+        // like no flag — generated loader -> ~/.niubashrc (--rcfile and
+        // NIU_RC_POLICY apply unchanged) -> completion -> greeting. The
+        // classification itself is untouched (`shopt login_shell`, the
+        // `-` argv[0] seed), and the non-interactive `-c` funnel keeps
+        // the GNU chain per niubash#399/#587/#602. POSIX mode is the one
+        // face that keeps the chain on Windows: it is the GNU/POSIX-compat
+        // face whose documented contract is GNU-faithful user-file
+        // selection (advanced-usage.md — "a login shell reads the profile
+        // chain"), and it has no rc to divert from ($ENV holds the rc
+        // seat) — so the `if login` tail inside the posix branch below
+        // stays keyed on the raw classification.
+        let login_diverts = login && (!cfg!(windows) || self.posix_mode_active());
+        if login_diverts {
             if repl {
                 self.session_mut().variables().set("NIU_REPL_STARTUP", "1");
             }
@@ -2370,9 +2422,12 @@ impl Shell {
             }
             return None;
         }
-        if login {
+        if login_diverts {
             // The profile chain replaces the rc branch only (shell.c:1833);
             // the env files above are not part of that exchange.
+            // niubash#1057: `login_diverts` is the gate — on Windows the
+            // ordinary face never takes this tail (the rc branch below
+            // runs instead); only posix mode keeps the GNU chain there.
             // niubash#590: the generated plugin loader is niu's own
             // activation plane, not the rc — the docs promise the host
             // sources it with no login exception, and returning here
@@ -11414,6 +11469,18 @@ complete -F _envtooldyn_hook envtooldyn
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cwd_guard = CwdGuard::capture();
         let mut shell = test_shell(HookConfig::default());
+        // GNU subst.c:9050 parameter_brace_substring returns NULL before
+        // verify_substring_values evaluates the offset when the parameter
+        // is unset, so the offset's arithmetic assignment never runs for
+        // an unset STARSHIP_START_TIME (rubash#3024 carries the same
+        // short-circuit: an unset variable's offsets are never expanded).
+        // The parameter must be set — even to a sentinel — for the offset
+        // to be evaluated at all; without this preset the PS0 expansion
+        // leaves the variable unset and the assertion below reads None.
+        shell
+            .session_mut()
+            .variables()
+            .set("STARSHIP_START_TIME", "0");
         shell.session_mut().variables().set(
             "PS0",
             "${STARSHIP_START_TIME:$((STARSHIP_START_TIME=12345,0)):0}",
@@ -12522,15 +12589,28 @@ mod invocation_name_tests {
     }
 
     #[test]
-    fn plain_niu_and_unknown_stems_keep_the_niu_default() {
-        // A direct niu.exe run (or any stem the shim never forwards) keeps
-        // the historical default byte-for-byte.
+    fn plain_niu_defaults_and_unknown_stems_bind_verbatim() {
+        // A missing name keeps the historical `niu` default; `niu` itself
+        // reports `niu` — the `.exe` suffix is a platform artifact, not
+        // part of the name. Every other non-face argv[0] binds its
+        // basename verbatim (niubash#3605 / rubash exec5.sub), keeping
+        // the leading '-' login mark in $0 exactly as GNU's
+        // dollar_vars[0] keeps argv[0] untouched.
         assert_eq!(default_script_name_from(None), "niu");
         assert_eq!(default_script_name_from(Some("niu".to_string())), "niu");
-        assert_eq!(default_script_name_from(Some("mysh".to_string())), "niu");
+        assert_eq!(default_script_name_from(Some("niu.exe".to_string())), "niu");
+        assert_eq!(default_script_name_from(Some("mysh".to_string())), "mysh");
+        assert_eq!(
+            default_script_name_from(Some("ohio-state".to_string())),
+            "ohio-state"
+        );
+        assert_eq!(
+            default_script_name_from(Some("-custom".to_string())),
+            "-custom"
+        );
         assert_eq!(
             default_script_name_from(Some("C:/x/bin/niubash.exe".to_string())),
-            "niu"
+            "niubash"
         );
     }
 
