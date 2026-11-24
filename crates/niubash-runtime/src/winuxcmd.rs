@@ -218,7 +218,8 @@ pub fn prepare_winuxcmd_with_override(override_path: Option<&Path>) -> Result<Pa
     auto_activate_bundled_winuxcmd(&exe);
     prepend_root_dirs_to_path(&root, &exe)?;
     prepend_session_link_dirs(&exe);
-    promote_user_git_dir_after_injection(&root, &exe);
+    #[cfg(windows)]
+    seed_niugit_credential_helper(&root, &exe);
     Ok(exe)
 }
 
@@ -240,7 +241,6 @@ pub fn ensure_on_path_with_override(override_path: Option<&Path>) -> Result<Path
     auto_activate_bundled_winuxcmd(&exe);
     prepend_root_dirs_to_path(&root, &exe)?;
     prepend_session_link_dirs(&exe);
-    promote_user_git_dir_after_injection(&root, &exe);
     Ok(root.join("usr").join("bin"))
 }
 
@@ -415,7 +415,17 @@ fn prepend_root_dirs_to_path(root: &Path, exe: &Path) -> Result<PathBuf> {
     let dirs = injected_path_dirs(root, exe);
 
     let current_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = path_with_dirs_prepended(&current_path, &dirs);
+    // Default: the bundled dirs prepend, so bundled commands win every
+    // name (niubash#1050 ruling, 2026-11-24 — the #1054 directory
+    // promotion is deleted). `NIU_USER_PATH_FIRST=1` is the single
+    // escape hatch: the bundled dirs append behind the inherited PATH
+    // instead, so the user's own PATH order wins wholesale while the
+    // bundled commands stay reachable as a fallback.
+    let new_path = if user_path_first() {
+        path_with_dirs_appended(&current_path, &dirs)
+    } else {
+        path_with_dirs_prepended(&current_path, &dirs)
+    };
     if new_path == current_path {
         return Ok(exe_dir);
     }
@@ -450,105 +460,350 @@ fn prepend_session_link_dirs(exe: &Path) {
     log::debug!("msix session PATH injected from: {}", links_root.display());
 }
 
-/// Promote the directory holding the user's git ahead of the bundled
-/// directories after injection (niubash#1050). The skip list is every
-/// directory injection contributed, so a git inside the bundled tree
-/// (or the session link tree) is never mistaken for the user's git.
-fn promote_user_git_dir_after_injection(root: &Path, exe: &Path) {
-    let mut skip = injected_path_dirs(root, exe);
+/// The `NIU_USER_PATH_FIRST` escape hatch (niubash#1050): only the
+/// exact value `1` flips PATH priority; unset, `0`, or anything else
+/// keeps the bundled-first default.
+fn user_path_first() -> bool {
+    std::env::var("NIU_USER_PATH_FIRST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Seed a fallback `credential.helper` via `GIT_CONFIG_COUNT` when bundled
+/// `niu-git` is the active `git` and the user has not configured one
+/// (`niubash#1067`).
+///
+/// Precedence & safety:
+/// - Skips when the first `git` on the effective PATH is not the bundled
+///   one (see `bundled_git_is_first_on_path`): a user git ahead of the
+///   bundled dirs already carries its own `etc/gitconfig` and helper.
+///   The verdict is read off the PATH itself, not off the `#1050`
+///   directory promotion that used to produce that order — the #1050
+///   adjudication (2026-11-24) deletes the promotion, and the scan stays
+///   correct under the restored bundled-first default and under the
+///   `NIU_USER_PATH_FIRST` escape alike.
+/// - Skips when `GIT_ASKPASS`, `GIT_CONFIG_NOSYSTEM`, or
+///   `GIT_CONFIG_GLOBAL=NUL|/dev/null` is set, or when `GIT_CONFIG_PARAMETERS`
+///   or `GIT_CONFIG_COUNT` already sets `credential.helper`.
+/// - Skips when the user's global gitconfig (`GIT_CONFIG_GLOBAL`,
+///   `~/.gitconfig`, or `$XDG_CONFIG_HOME/git/config`) already defines an
+///   un-scoped `[credential] helper = ...` (including an empty `helper =`
+///   reset). Scoped helpers such as `[credential "https://github.com"]` do not
+///   suppress the fallback for other hosts.
+/// - Prefers host `git-credential-manager.exe` (or legacy
+///   `git-credential-manager-core.exe`) on `PATH` or in standard Windows
+///   install paths, falling back to bundled `wincred` when present.
+#[cfg(windows)]
+fn seed_niugit_credential_helper(root: &Path, exe: &Path) {
+    if !has_bundled_niugit(root) || !bundled_git_is_first_on_path(root, exe) {
+        return;
+    }
+    if env_blocks_credential_helper_seeding() {
+        return;
+    }
+    if user_gitconfig_has_credential_helper() {
+        return;
+    }
+    let Some(helper) = resolve_niugit_credential_helper(root) else {
+        return;
+    };
+    let existing_count = match std::env::var("GIT_CONFIG_COUNT") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return,
+        },
+        _ => 0,
+    };
+    std::env::set_var("GIT_CONFIG_COUNT", (existing_count + 1).to_string());
+    std::env::set_var(
+        format!("GIT_CONFIG_KEY_{existing_count}"),
+        "credential.helper",
+    );
+    std::env::set_var(format!("GIT_CONFIG_VALUE_{existing_count}"), &helper);
+    log::debug!("seeded niu-git fallback credential.helper={helper} (niubash#1067)");
+}
+
+/// Whether the first `git` on the effective PATH is the bundled one.
+///
+/// The `#1067` credential seed exists for bundled niu-git, which ships no
+/// system gitconfig of its own; a user git ahead of it on PATH carries its
+/// own and must not be seeded over. The verdict is read off the PATH as it
+/// stands at seed time — after injection (and, today, after the `#1050`
+/// directory promotion) — instead of being coupled to any one mechanism
+/// that produced that order: the #1050 adjudication (2026-11-24) deletes
+/// the promotion and restores the bundled-first default with a
+/// `NIU_USER_PATH_FIRST` escape, and this scan gives the right answer
+/// under both orders.
+#[cfg(windows)]
+fn bundled_git_is_first_on_path(root: &Path, exe: &Path) -> bool {
+    let mut bundled_dirs = injected_path_dirs(root, exe);
     if let Some(links_root) = crate::msix::session_writable_root() {
-        skip.extend(injected_path_dirs(&links_root, exe));
+        bundled_dirs.extend(injected_path_dirs(&links_root, exe));
     }
     let current = std::env::var("PATH").unwrap_or_default();
-    let promoted = promote_user_git_dir_in_path(&current, &skip);
-    if promoted != current {
-        std::env::set_var("PATH", &promoted);
-        log::debug!("user git directory promoted ahead of bundled dirs (niubash#1050)");
-    }
+    let entries: Vec<&str> = current.split(path_list_separator()).collect();
+    first_git_dir_is_bundled(&entries, &bundled_dirs)
 }
 
-/// The git executable a directory contributes to PATH resolution:
-/// `git.exe` on Windows, the bare `git` elsewhere.
-fn user_git_file_name() -> &'static str {
-    if cfg!(windows) {
-        "git.exe"
-    } else {
-        "git"
-    }
-}
-
-/// Whether `dir` is the same directory as, or lives below, `ancestor`
-/// (separator- and — on Windows — case-normalized, via
-/// `comparable_path_entry`).
-fn path_is_within_or_equal(dir: &str, ancestor: &Path) -> bool {
-    let dir = comparable_path_entry(dir);
-    let ancestor = comparable_path_entry(&ancestor.to_string_lossy());
-    if ancestor.is_empty() {
-        return false;
-    }
-    dir == ancestor || dir.starts_with(&format!("{ancestor}/"))
-}
-
-/// First PATH entry holding a git outside the bundled tree: the user's
-/// own git, in the user's own PATH order. Bundled directories (the
-/// `skip` list) and any directory that carries a `winuxcmd.exe` (another
-/// winuxcmd tree's directory) are not the user's git. The scan stops at
-/// the first hit, so a session without a user git pays at most two
-/// filesystem probes per PATH entry.
-fn find_user_git_dir<'a>(entries: &[&'a str], skip_dirs: &[PathBuf]) -> Option<&'a str> {
-    let git_name = user_git_file_name();
+/// First-hit scan over the PATH entries, walked in order; the first
+/// entry holding a git decides the verdict.
+/// `true` when that entry lies within the bundled tree, `false` when it
+/// is a foreign directory — or when no entry holds a git at all (no git
+/// resolves, so there is no bundled git to seed for).
+#[cfg(any(windows, test))]
+fn first_git_dir_is_bundled(entries: &[&str], bundled_dirs: &[PathBuf]) -> bool {
+    let git_name = if cfg!(windows) { "git.exe" } else { "git" };
     for entry in entries {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
-        if skip_dirs
-            .iter()
-            .any(|dir| path_is_within_or_equal(entry, dir))
-        {
-            continue;
-        }
         let dir = PathBuf::from(entry.trim_matches('"'));
-        if dir.join("winuxcmd.exe").is_file() {
+        if dir.join(git_name).is_file() {
+            return bundled_dirs.iter().any(|bundled| {
+                let entry_cmp = comparable_path_entry(entry);
+                let ancestor_cmp = comparable_path_entry(&bundled.to_string_lossy());
+                !ancestor_cmp.is_empty()
+                    && (entry_cmp == ancestor_cmp
+                        || entry_cmp.starts_with(&format!("{ancestor_cmp}/")))
+            });
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn has_bundled_niugit(root: &Path) -> bool {
+    root.join("usr/bin/git.exe").is_file() || root.join("opt/niugit/mingw64/bin/git.exe").is_file()
+}
+
+#[cfg(windows)]
+fn env_blocks_credential_helper_seeding() -> bool {
+    if std::env::var_os("GIT_ASKPASS").is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    if let Ok(nosys) = std::env::var("GIT_CONFIG_NOSYSTEM") {
+        let trimmed = nosys.trim();
+        if !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false") {
+            return true;
+        }
+    }
+    if let Ok(global) = std::env::var("GIT_CONFIG_GLOBAL") {
+        let trimmed = global.trim();
+        if trimmed.eq_ignore_ascii_case("nul") || trimmed == "/dev/null" {
+            return true;
+        }
+    }
+    if let Ok(params) = std::env::var("GIT_CONFIG_PARAMETERS") {
+        if params.to_ascii_lowercase().contains("credential.helper") {
+            return true;
+        }
+    }
+    if let Ok(raw_count) = std::env::var("GIT_CONFIG_COUNT") {
+        let trimmed = raw_count.trim();
+        if !trimmed.is_empty() {
+            let Ok(count) = trimmed.parse::<usize>() else {
+                return true;
+            };
+            for i in 0..count {
+                if let Ok(key) = std::env::var(format!("GIT_CONFIG_KEY_{i}")) {
+                    if key.trim().eq_ignore_ascii_case("credential.helper") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn user_gitconfig_has_credential_helper() -> bool {
+    for path in user_gitconfig_paths() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if gitconfig_has_unscoped_credential_helper(&contents) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn user_gitconfig_paths() -> Vec<PathBuf> {
+    if let Ok(global) = std::env::var("GIT_CONFIG_GLOBAL") {
+        let trimmed = global.trim();
+        if !trimmed.is_empty() {
+            return vec![PathBuf::from(trimmed)];
+        }
+    }
+    let mut paths = Vec::new();
+    let userprofile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(ref up) = userprofile {
+        paths.push(up.join(".gitconfig"));
+    }
+    if let Some(ref h) = home {
+        let h_cfg = h.join(".gitconfig");
+        if !paths.contains(&h_cfg) {
+            paths.push(h_cfg);
+        }
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        paths.push(PathBuf::from(xdg).join("git").join("config"));
+    } else if let Some(base) = home.as_ref().or(userprofile.as_ref()) {
+        paths.push(base.join(".config").join("git").join("config"));
+    }
+    paths
+}
+
+/// Returns `true` if the INI-style gitconfig text contains an un-scoped
+/// `[credential]` section with a `helper` key (including an empty `helper =`
+/// reset). Subsection headers like `[credential "https://github.com"]` do
+/// not match.
+#[cfg(any(windows, test))]
+fn gitconfig_has_unscoped_credential_helper(contents: &str) -> bool {
+    let mut in_credential_section = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if dir.join(git_name).is_file() {
-            return Some(entry);
+        if line.starts_with('[') {
+            in_credential_section = line
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .is_some_and(|inner| inner.trim().eq_ignore_ascii_case("credential"));
+            continue;
         }
+        if in_credential_section {
+            if let Some((key, _)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("helper") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(any(windows, test))]
+fn format_git_credential_helper_command(exe_path: &Path) -> String {
+    let forward = exe_path.to_string_lossy().replace('\\', "/");
+    let escaped = forward.replace('\'', "'\\''");
+    format!("!'{escaped}'")
+}
+
+#[cfg(windows)]
+fn resolve_niugit_credential_helper(root: &Path) -> Option<String> {
+    if let Some(gcm) = find_host_gcm_executable() {
+        return Some(format_git_credential_helper_command(&gcm));
+    }
+    let bundled_wincred = root
+        .join("opt")
+        .join("niugit")
+        .join("mingw64")
+        .join("libexec")
+        .join("git-core")
+        .join("git-credential-wincred.exe");
+    if bundled_wincred.is_file() {
+        return Some("wincred".to_string());
     }
     None
 }
 
-/// Move the directory holding the user's git to the front of PATH.
-///
-/// niubash#1050: PATH injection prepends the bundled directories ahead
-/// of the user's inherited PATH, so the bundled niugit in
-/// `<root>\usr\bin` always won `git` — for the `git` command and for
-/// the prompt's `git` spawn alike, since both resolve through PATH.
-/// A git the user installed and put on PATH is an explicit choice, so
-/// its directory is promoted ahead of the bundled directories. PATH
-/// orders directories, not commands, so the promotion is directory
-/// granularity: the whole directory moves, and only the first git on
-/// the user's PATH (the user's own order) is promoted. Everything else
-/// keeps its relative order: the bundled directories stay ahead of the
-/// rest of the user's PATH, and with no user git the PATH is returned
-/// unchanged.
-fn promote_user_git_dir_in_path(current_path: &str, skip_dirs: &[PathBuf]) -> String {
-    let sep = path_list_separator();
-    let entries: Vec<&str> = current_path.split(sep).collect();
-    let Some(user_dir) = find_user_git_dir(&entries, skip_dirs) else {
-        return current_path.to_string();
-    };
-    let mut parts: Vec<String> = entries
+#[cfg(windows)]
+fn find_host_gcm_executable() -> Option<PathBuf> {
+    if let Some(on_path) = find_file_in_path_dirs("git-credential-manager.exe") {
+        return Some(on_path);
+    }
+    let candidates = host_gcm_candidates_from_env(
+        std::env::var_os("ProgramFiles").as_deref(),
+        std::env::var_os("ProgramFiles(x86)").as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    );
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(any(windows, test))]
+fn host_gcm_candidates_from_env(
+    program_files: Option<&std::ffi::OsStr>,
+    program_files_x86: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let git_rel_paths = [
+        "Git/mingw64/bin/git-credential-manager.exe",
+        "Git/mingw64/libexec/git-core/git-credential-manager.exe",
+        "Git/usr/bin/git-credential-manager.exe",
+    ];
+    let standalone_gcm_rel = "Git Credential Manager/git-credential-manager.exe";
+
+    for base in [program_files, program_files_x86].into_iter().flatten() {
+        let base_path = Path::new(base);
+        for rel in git_rel_paths {
+            candidates.push(base_path.join(rel));
+        }
+        candidates.push(base_path.join(standalone_gcm_rel));
+    }
+    if let Some(local) = local_app_data {
+        let programs = Path::new(local).join("Programs");
+        for rel in git_rel_paths {
+            candidates.push(programs.join(rel));
+        }
+        candidates.push(programs.join(standalone_gcm_rel));
+    }
+    if let Some(up) = user_profile {
+        let scoop = Path::new(up).join("scoop").join("apps");
+        candidates.push(scoop.join("git/current/mingw64/bin/git-credential-manager.exe"));
+        candidates.push(scoop.join("git-credential-manager/current/git-credential-manager.exe"));
+    }
+
+    // Legacy Git Credential Manager Core fallback.
+    let legacy_rel_paths = [
+        "Git/mingw64/libexec/git-core/git-credential-manager-core.exe",
+        "Git/mingw64/bin/git-credential-manager-core.exe",
+    ];
+    for base in [program_files, program_files_x86].into_iter().flatten() {
+        let base_path = Path::new(base);
+        for rel in legacy_rel_paths {
+            candidates.push(base_path.join(rel));
+        }
+    }
+    if let Some(local) = local_app_data {
+        let programs = Path::new(local).join("Programs");
+        for rel in legacy_rel_paths {
+            candidates.push(programs.join(rel));
+        }
+    }
+    candidates
+}
+
+/// `current_path` with `dirs` appended behind it, in order. Existing
+/// occurrences of the appended dirs are dropped first, so re-injection
+/// never duplicates them; every other entry keeps its place — in
+/// user-first mode the inherited order is the user's decision, taken
+/// whole.
+fn path_with_dirs_appended(current_path: &str, dirs: &[PathBuf]) -> String {
+    let desired = dirs
         .iter()
+        .map(|dir| comparable_path_entry(&dir.to_string_lossy()))
+        .collect::<Vec<_>>();
+    let mut parts: Vec<String> = current_path
+        .split(path_list_separator())
         .filter_map(|entry| {
             let entry = entry.trim();
-            (!entry.is_empty() && comparable_path_entry(entry) != comparable_path_entry(user_dir))
+            let comparable = comparable_path_entry(entry);
+            (!entry.is_empty() && !desired.iter().any(|dir| dir == &comparable))
                 .then(|| entry.to_string())
         })
         .collect();
-    parts.insert(0, user_dir.to_string());
-    parts.join(&sep.to_string())
+    for dir in dirs {
+        parts.push(dir.to_string_lossy().to_string());
+    }
+    parts.join(&path_list_separator().to_string())
 }
 
 fn path_with_dirs_prepended(current_path: &str, dirs: &[PathBuf]) -> String {
@@ -2347,66 +2602,132 @@ mod path_order_tests {
         }
     }
 
-    /// niubash#1050 (fail-first nail): a git the user installed and put
-    /// on PATH (scoop shims / Git for Windows) must win over the bundled
-    /// niugit in `<root>\usr\bin`, for the `git` command and for the
-    /// prompt's `git` spawn alike — both resolve through PATH, so the
-    /// ordering decision is the PATH injection's.
-    #[test]
-    fn issue1050_user_git_on_path_wins_over_bundled_git() {
-        let git_name = git_file_name();
-        let root = unique_temp_dir("winuxcmd-1050-root");
+    /// RAII guard for one environment variable (the switch under test,
+    /// and the activation skip the injection entry requires).
+    struct SavedEnv {
+        name: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl SavedEnv {
+        fn set(name: &'static str, value: Option<&str>) -> Self {
+            let saved = std::env::var_os(name);
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            SavedEnv { name, saved }
+        }
+    }
+
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    /// A name only the bundled tree carries, so its first hit proves
+    /// the bundled dirs stay reachable in every switch state.
+    const BUNDLED_ONLY_NAME: &str = "niu-bundled-only-probe";
+
+    /// Stage for the #1050 PATH-priority pins: a fake bundled root
+    /// whose `usr/bin` carries git + bash + sh + one bundled-only name,
+    /// and a user directory holding the user's own git AND bash — the
+    /// whq12520 shape (one shared shim directory), where promoting the
+    /// directory for git's sake used to drag its bash/sh ahead of the
+    /// bundled ones too.
+    struct PriorityStage {
+        root: PathBuf,
+        bundled_bin: PathBuf,
+        user_dir: PathBuf,
+        other_dir: PathBuf,
+    }
+
+    fn priority_stage(tag: &str, user_has_git: bool) -> PriorityStage {
+        let root = unique_temp_dir(tag);
         let bundled_bin = root.join("usr").join("bin");
         std::fs::create_dir_all(&bundled_bin).unwrap();
         std::fs::write(bundled_bin.join("winuxcmd.exe"), b"").unwrap();
-        std::fs::write(bundled_bin.join(git_name), b"bundled").unwrap();
-        let user_git_dir = unique_temp_dir("winuxcmd-1050-user-git");
-        std::fs::create_dir_all(&user_git_dir).unwrap();
-        std::fs::write(user_git_dir.join(git_name), b"user").unwrap();
-        let other_dir = unique_temp_dir("winuxcmd-1050-other");
-        std::fs::create_dir_all(&other_dir).unwrap();
-
-        let prev_skip = std::env::var_os("NIU_SKIP_WINUXCMD_ACTIVATION");
-        std::env::set_var("NIU_SKIP_WINUXCMD_ACTIVATION", "1");
-        let _saved = SavedPath::set(&[user_git_dir.clone(), other_dir.clone()]);
-        let result = ensure_on_path_with_override(Some(&root));
-        match prev_skip {
-            Some(value) => std::env::set_var("NIU_SKIP_WINUXCMD_ACTIVATION", value),
-            None => std::env::remove_var("NIU_SKIP_WINUXCMD_ACTIVATION"),
+        for name in [git_file_name(), "bash", "sh", BUNDLED_ONLY_NAME] {
+            std::fs::write(bundled_bin.join(name), b"bundled").unwrap();
         }
-        result.unwrap();
-        let path = std::env::var("PATH").unwrap();
-        let first_git = std::env::split_paths(&path)
-            .find(|dir| dir.join(git_name).is_file())
-            .expect("some git must be on PATH after injection");
-        assert_eq!(
-            first_git, user_git_dir,
-            "user git must win over bundled git; PATH={path}"
-        );
-        // The bundled dirs must still be injected ahead of the rest of
-        // the user's PATH: only the user-git directory moves.
+        let user_dir = unique_temp_dir(&format!("{tag}-user"));
+        std::fs::create_dir_all(&user_dir).unwrap();
+        if user_has_git {
+            std::fs::write(user_dir.join(git_file_name()), b"user").unwrap();
+        }
+        std::fs::write(user_dir.join("bash"), b"user").unwrap();
+        let other_dir = unique_temp_dir(&format!("{tag}-other"));
+        std::fs::create_dir_all(&other_dir).unwrap();
+        PriorityStage {
+            root,
+            bundled_bin,
+            user_dir,
+            other_dir,
+        }
+    }
+
+    impl Drop for PriorityStage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.user_dir);
+            let _ = std::fs::remove_dir_all(&self.other_dir);
+        }
+    }
+
+    /// Run the real injection entry with the stage's user dirs as the
+    /// inherited PATH and the given `NIU_USER_PATH_FIRST` state
+    /// (`None` = unset); returns the resulting PATH string.
+    fn injected_path(stage: &PriorityStage, switch: Option<&str>) -> String {
+        let _saved_path = SavedPath::set(&[stage.user_dir.clone(), stage.other_dir.clone()]);
+        let _saved_skip = SavedEnv::set("NIU_SKIP_WINUXCMD_ACTIVATION", Some("1"));
+        let _saved_switch = SavedEnv::set("NIU_USER_PATH_FIRST", switch);
+        ensure_on_path_with_override(Some(&stage.root)).unwrap();
+        std::env::var("PATH").unwrap()
+    }
+
+    fn first_hit(path: &str, name: &str) -> Option<PathBuf> {
+        std::env::split_paths(path).find(|dir| dir.join(name).is_file())
+    }
+
+    /// niubash#1050, captain ruling 2026-11-24: the bundled dirs are
+    /// first BY DEFAULT (the #1054 directory promotion is gone), so a
+    /// user directory that happens to hold both git and bash — scoop
+    /// shims — shadows nothing: git, bash and sh all first-hit the
+    /// bundled tree.
+    #[test]
+    fn issue1050_default_bundled_dirs_win_first_hit() {
+        let stage = priority_stage("winuxcmd-1050-default", true);
+        let path = injected_path(&stage, None);
+        for name in [git_file_name(), "bash", "sh", BUNDLED_ONLY_NAME] {
+            assert_eq!(
+                first_hit(&path, name),
+                Some(stage.bundled_bin.clone()),
+                "{name} must first-hit the bundled dir by default; PATH={path}"
+            );
+        }
+        // The bundled dirs stay ahead of the rest of the user's PATH.
         let parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
         let bundled_pos = parts
             .iter()
-            .position(|dir| *dir == bundled_bin)
+            .position(|dir| *dir == stage.bundled_bin)
             .expect("bundled usr/bin injected");
         let other_pos = parts
             .iter()
-            .position(|dir| *dir == other_dir)
+            .position(|dir| *dir == stage.other_dir)
             .expect("other user dir kept");
         assert!(
             bundled_pos < other_pos,
-            "bundled dirs stay ahead of the rest of user PATH; PATH={path}"
+            "bundled dirs stay ahead of user PATH; PATH={path}"
         );
-
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(user_git_dir);
-        let _ = std::fs::remove_dir_all(other_dir);
     }
 
-    /// Shared staging for the `promote_user_git_dir_in_path` pins: a
-    /// fake bundled root (with a git in `usr/bin`, as niugit ships) and
-    /// two plain directories, one holding a user git.
+    /// Shared staging for the PATH first-hit pins: a fake bundled root
+    /// (with a git in `usr/bin`, as niugit ships) and two plain
+    /// directories, one holding a user git.
     struct PromotionStage {
         root: PathBuf,
         bundled_bin: PathBuf,
@@ -2445,15 +2766,18 @@ mod path_order_tests {
         injected_path_dirs(&stage.root, &stage.bundled_bin.join("winuxcmd.exe"))
     }
 
-    fn split(path: &str) -> Vec<PathBuf> {
-        std::env::split_paths(path).collect()
-    }
-
+    /// niubash#1067 × #1050 adjudication: the credential seed's gate is
+    /// the first-git-on-PATH verdict, not the promotion mechanism — the
+    /// same staging must answer `true` for the bundled-first order and
+    /// `false` for the user-first order (today produced by the #1050
+    /// promotion; after the adjudication deletes it, by
+    /// `NIU_USER_PATH_FIRST`), and `false` when no git resolves at all.
     #[test]
-    fn issue1050_promotion_moves_user_git_dir_to_front() {
-        let stage = promotion_stage("winuxcmd-1050-promote");
+    fn issue1067_first_git_verdict_follows_first_hit() {
+        let stage = promotion_stage("winuxcmd-1067-first-hit");
+        let bundled = injected_dirs(&stage);
         let sep = path_list_separator();
-        let current = format!(
+        let bundled_first = format!(
             "{}{}{}{}{}",
             stage.bundled_bin.display(),
             sep,
@@ -2461,96 +2785,105 @@ mod path_order_tests {
             sep,
             stage.user_git_dir.display()
         );
-        let promoted = promote_user_git_dir_in_path(&current, &injected_dirs(&stage));
-        let parts = split(&promoted);
-        assert_eq!(parts[0], stage.user_git_dir, "PATH={promoted}");
-        // Bundled dirs stay ahead of the rest of the user's PATH.
-        let bundled_pos = parts
+        let entries: Vec<&str> = bundled_first.split(sep).collect();
+        assert!(
+            first_git_dir_is_bundled(&entries, &bundled),
+            "bundled git leads PATH={bundled_first}"
+        );
+        let user_first = format!(
+            "{}{}{}{}{}",
+            stage.user_git_dir.display(),
+            sep,
+            stage.bundled_bin.display(),
+            sep,
+            stage.other_dir.display()
+        );
+        let entries: Vec<&str> = user_first.split(sep).collect();
+        assert!(
+            !first_git_dir_is_bundled(&entries, &bundled),
+            "user git leads PATH={user_first}"
+        );
+        let _ = std::fs::remove_file(stage.bundled_bin.join(git_file_name()));
+        let _ = std::fs::remove_file(stage.user_git_dir.join(git_file_name()));
+        let entries: Vec<&str> = bundled_first.split(sep).collect();
+        assert!(
+            !first_git_dir_is_bundled(&entries, &bundled),
+            "no git on PATH={bundled_first}"
+        );
+    }
+
+    /// `NIU_USER_PATH_FIRST=0` is the default spelled out: bundled wins.
+    #[test]
+    fn issue1050_switch_zero_behaves_like_default() {
+        let stage = priority_stage("winuxcmd-1050-switch0", true);
+        let path = injected_path(&stage, Some("0"));
+        for name in [git_file_name(), "bash"] {
+            assert_eq!(
+                first_hit(&path, name),
+                Some(stage.bundled_bin.clone()),
+                "{name} must first-hit the bundled dir with switch=0; PATH={path}"
+            );
+        }
+    }
+
+    /// `NIU_USER_PATH_FIRST=1`: the user's inherited PATH order wins
+    /// wholesale — the user's git and bash first-hit the user dir —
+    /// while the bundled dirs append behind it, so a bundled-only
+    /// command still resolves as a fallback.
+    #[test]
+    fn issue1050_switch_one_user_path_wins_bundled_stays_reachable() {
+        let stage = priority_stage("winuxcmd-1050-switch1", true);
+        let path = injected_path(&stage, Some("1"));
+        for name in [git_file_name(), "bash"] {
+            assert_eq!(
+                first_hit(&path, name),
+                Some(stage.user_dir.clone()),
+                "{name} must first-hit the user dir with switch=1; PATH={path}"
+            );
+        }
+        assert_eq!(
+            first_hit(&path, BUNDLED_ONLY_NAME),
+            Some(stage.bundled_bin.clone()),
+            "bundled-only command must stay reachable with switch=1; PATH={path}"
+        );
+        // User order is preserved whole, bundled dirs behind all of it.
+        let parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        let user_pos = parts
             .iter()
-            .position(|dir| *dir == stage.bundled_bin)
-            .unwrap();
+            .position(|dir| *dir == stage.user_dir)
+            .expect("user dir kept");
         let other_pos = parts
             .iter()
             .position(|dir| *dir == stage.other_dir)
-            .unwrap();
-        assert!(bundled_pos < other_pos, "PATH={promoted}");
+            .expect("other user dir kept");
+        let bundled_pos = parts
+            .iter()
+            .position(|dir| *dir == stage.bundled_bin)
+            .expect("bundled usr/bin injected");
+        assert!(
+            user_pos < other_pos && other_pos < bundled_pos,
+            "user PATH order first, bundled appended; PATH={path}"
+        );
     }
 
+    /// With no user git anywhere, injection changes PATH by exactly
+    /// the bundled prepend and nothing else (the deleted promotion had
+    /// no observable effect in this shape either — invariance guard).
     #[test]
-    fn issue1050_promotion_leaves_path_alone_without_user_git() {
-        let stage = promotion_stage("winuxcmd-1050-no-user-git");
-        let _ = std::fs::remove_file(stage.user_git_dir.join(git_file_name()));
-        let sep = path_list_separator();
-        let current = format!(
-            "{}{}{}",
-            stage.bundled_bin.display(),
-            sep,
-            stage.other_dir.display()
-        );
+    fn issue1050_without_user_git_injection_is_pure_prepend() {
+        let stage = priority_stage("winuxcmd-1050-no-user-git", false);
+        let original = std::env::join_paths([stage.user_dir.clone(), stage.other_dir.clone()])
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let exe = stage.bundled_bin.join("winuxcmd.exe");
+        let expected = path_with_dirs_prepended(&original, &injected_path_dirs(&stage.root, &exe));
+        let path = injected_path(&stage, None);
         assert_eq!(
-            promote_user_git_dir_in_path(&current, &injected_dirs(&stage)),
-            current
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            std::env::split_paths(&expected).collect::<Vec<_>>(),
+            "PATH={path}"
         );
-    }
-
-    #[test]
-    fn issue1050_promotion_ignores_git_inside_bundled_tree() {
-        // Only the bundled git exists: nothing is the user's git.
-        let stage = promotion_stage("winuxcmd-1050-bundled-only");
-        let sep = path_list_separator();
-        let current = format!(
-            "{}{}{}",
-            stage.bundled_bin.display(),
-            sep,
-            stage.other_dir.display()
-        );
-        assert_eq!(
-            promote_user_git_dir_in_path(&current, &injected_dirs(&stage)),
-            current
-        );
-    }
-
-    #[test]
-    fn issue1050_promotion_first_user_git_wins() {
-        let stage = promotion_stage("winuxcmd-1050-first-wins");
-        let second_git_dir = unique_temp_dir("winuxcmd-1050-first-wins-second");
-        std::fs::create_dir_all(&second_git_dir).unwrap();
-        std::fs::write(second_git_dir.join(git_file_name()), b"second").unwrap();
-        let sep = path_list_separator();
-        let current = format!(
-            "{}{}{}{}{}",
-            stage.bundled_bin.display(),
-            sep,
-            stage.user_git_dir.display(),
-            sep,
-            second_git_dir.display()
-        );
-        let promoted = promote_user_git_dir_in_path(&current, &injected_dirs(&stage));
-        assert_eq!(split(&promoted)[0], stage.user_git_dir, "PATH={promoted}");
-        let _ = std::fs::remove_dir_all(second_git_dir);
-    }
-
-    #[test]
-    fn issue1050_promotion_skips_winuxcmd_tree_dir() {
-        // A directory carrying winuxcmd.exe is another winuxcmd tree,
-        // not the user's git — even though it holds a git.
-        let stage = promotion_stage("winuxcmd-1050-skip-tree");
-        let other_tree = unique_temp_dir("winuxcmd-1050-skip-tree-other");
-        std::fs::create_dir_all(&other_tree).unwrap();
-        std::fs::write(other_tree.join("winuxcmd.exe"), b"").unwrap();
-        std::fs::write(other_tree.join(git_file_name()), b"other-tree").unwrap();
-        let sep = path_list_separator();
-        let current = format!(
-            "{}{}{}{}{}",
-            stage.bundled_bin.display(),
-            sep,
-            other_tree.display(),
-            sep,
-            stage.user_git_dir.display()
-        );
-        let promoted = promote_user_git_dir_in_path(&current, &injected_dirs(&stage));
-        assert_eq!(split(&promoted)[0], stage.user_git_dir, "PATH={promoted}");
-        let _ = std::fs::remove_dir_all(other_tree);
     }
 
     #[test]
@@ -2590,5 +2923,66 @@ mod path_order_tests {
         assert!(crate::shell_links::same_file(&engine, &stale));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn issue1067_gitconfig_detects_unscoped_credential_helper_only() {
+        assert!(gitconfig_has_unscoped_credential_helper(
+            "[credential]\n\thelper = manager\n"
+        ));
+        assert!(gitconfig_has_unscoped_credential_helper(
+            "[credential]\n\thelper =\n"
+        ));
+        assert!(gitconfig_has_unscoped_credential_helper(
+            "[Credential]\n  HELPER = store\n[user]\n  name = Alice\n"
+        ));
+        assert!(!gitconfig_has_unscoped_credential_helper(
+            "[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n"
+        ));
+        assert!(!gitconfig_has_unscoped_credential_helper(
+            "[user]\n\tname = Alice\n# [credential]\n# helper = store\n"
+        ));
+    }
+
+    #[test]
+    fn issue1067_format_credential_helper_command_handles_spaces_and_quotes() {
+        assert_eq!(
+            format_git_credential_helper_command(Path::new(
+                r"C:\Program Files\Git\mingw64\bin\git-credential-manager.exe"
+            )),
+            "!'C:/Program Files/Git/mingw64/bin/git-credential-manager.exe'"
+        );
+        assert_eq!(
+            format_git_credential_helper_command(Path::new(
+                r"C:\Users\O'Brien\gcm\git-credential-manager.exe"
+            )),
+            "!'C:/Users/O'\\''Brien/gcm/git-credential-manager.exe'"
+        );
+    }
+
+    #[test]
+    fn issue1067_host_gcm_candidates_include_standard_locations() {
+        use std::ffi::OsStr;
+        let candidates = host_gcm_candidates_from_env(
+            Some(OsStr::new(r"C:\Program Files")),
+            Some(OsStr::new(r"C:\Program Files (x86)")),
+            Some(OsStr::new(r"C:\Users\alice\AppData\Local")),
+            Some(OsStr::new(r"C:\Users\alice")),
+        );
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Program Files\Git\mingw64\bin\git-credential-manager.exe"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Program Files\Git Credential Manager\git-credential-manager.exe"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Users\alice\AppData\Local\Programs\Git\mingw64\bin\git-credential-manager.exe"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Users\alice\scoop\apps\git\current\mingw64\bin\git-credential-manager.exe"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Program Files\Git\mingw64\libexec\git-core\git-credential-manager-core.exe"
+        )));
     }
 }
